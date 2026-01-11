@@ -1,0 +1,1 @@
+../Resources/convert_to_SVG.sh
