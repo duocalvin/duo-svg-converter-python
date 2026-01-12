@@ -109,13 +109,6 @@ echo "• Close Illustrator when complete"
 echo "• Show completion notification"
 echo
 
-# Check if Illustrator exists
-if [ ! -d "$ILLUSTRATOR_PATH" ]; then
-    echo -e "${RED}❌ Error: Illustrator not found at $ILLUSTRATOR_PATH${NC}"
-    echo "Please update the ILLUSTRATOR_PATH variable in this script."
-    exit 1
-fi
-
 # Step 1: Parse CLI options (input folder preferred) then fallback to dialog
 selected_folder=""
 TRACE_COLORS=""
@@ -125,6 +118,7 @@ TRACE_TRANSPARENT=""
 OUT_SCALE=""
 OUT_W=""
 OUT_H=""
+CLI_ILLUSTRATOR_PATH=""
 
 _is_number() { echo "$1" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; }
 _is_int() { echo "$1" | grep -Eq '^[0-9]+$'; }
@@ -169,6 +163,12 @@ while [ $idx -lt ${#ARGS[@]} ]; do
             val="${ARGS[$((idx+1))]:-}"
             [ -z "$val" ] && { echo -e "${RED}❌ --scale requires a value (float)${NC}"; exit 1; }
             OUT_SCALE="$val"
+            idx=$((idx+2))
+            ;;
+        --illustrator-path)
+            val="${ARGS[$((idx+1))]:-}"
+            [ -z "$val" ] && { echo -e "${RED}❌ --illustrator-path requires a value${NC}"; exit 1; }
+            CLI_ILLUSTRATOR_PATH="$val"
             idx=$((idx+2))
             ;;
         --out-w)
@@ -220,6 +220,19 @@ else
         exit 1
     fi
 fi
+
+# If an override Illustrator path was provided, use it
+if [ -n "$CLI_ILLUSTRATOR_PATH" ]; then
+    ILLUSTRATOR_PATH="$CLI_ILLUSTRATOR_PATH"
+fi
+
+# Now check Illustrator exists after possible override
+if [ ! -d "$ILLUSTRATOR_PATH" ]; then
+    echo -e "${RED}❌ Error: Illustrator not found at $ILLUSTRATOR_PATH${NC}"
+    echo "Provide a valid path via --illustrator-path or update ILLUSTRATOR_PATH in the script."
+    exit 1
+fi
+echo -e "${BLUE}🖌  Using Illustrator at: $ILLUSTRATOR_PATH${NC}"
 
 # Validate options if provided
 if [ -n "$TRACE_COLORS" ]; then

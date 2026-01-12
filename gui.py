@@ -1,6 +1,8 @@
 import os
 import sys
 import shutil
+import re
+import xml.etree.ElementTree as ET
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QProcess, QSettings
@@ -26,6 +28,9 @@ from PyQt6.QtWidgets import (
     QRadioButton,
     QButtonGroup,
 )
+
+
+DEFAULT_ILLUSTRATOR_APP = "/Applications/Adobe Illustrator 2025/Adobe Illustrator.app"
 
 
 def get_resource_path(relative_name: str) -> Optional[str]:
@@ -100,6 +105,18 @@ class SvgConverterApp(QWidget):
         output_row.addWidget(browse_output_btn)
         layout.addLayout(output_row)
 
+        # Illustrator app chooser
+        ai_row = QHBoxLayout()
+        ai_label = QLabel("Illustrator app:")
+        self.illustrator_edit = QLineEdit()
+        self.illustrator_edit.setReadOnly(True)
+        browse_ai_btn = QPushButton("Browse…")
+        browse_ai_btn.clicked.connect(self._browse_illustrator)
+        ai_row.addWidget(ai_label)
+        ai_row.addWidget(self.illustrator_edit, 1)
+        ai_row.addWidget(browse_ai_btn)
+        layout.addLayout(ai_row)
+
         self.open_when_done = QCheckBox("Open output folder when done")
         self.open_when_done.setChecked(True)
         layout.addWidget(self.open_when_done)
@@ -124,6 +141,11 @@ class SvgConverterApp(QWidget):
         layout.addWidget(self.log, 1)
 
         self.setLayout(layout)
+
+    def _is_valid_illustrator_app(self, path: str) -> bool:
+        if not path:
+            return False
+        return os.path.isdir(path) and path.endswith(".app")
 
     def _build_trace_settings_group(self) -> QWidget:
         # Collapsible header
@@ -280,6 +302,12 @@ class SvgConverterApp(QWidget):
             self.input_edit.setText(last_input)
         if last_output and os.path.isdir(last_output):
             self.output_edit.setText(last_output)
+        ai_path = self.settings.value("illustrator_app_path", "", type=str)
+        if not ai_path:
+            ai_path = DEFAULT_ILLUSTRATOR_APP
+            self.settings.setValue("illustrator_app_path", ai_path)
+        if self.illustrator_edit:
+            self.illustrator_edit.setText(ai_path)
 
     def _browse_input(self) -> None:
         start_dir = self.input_edit.text() or os.path.expanduser("~")
@@ -294,6 +322,17 @@ class SvgConverterApp(QWidget):
         if directory:
             self.output_edit.setText(directory)
             self.settings.setValue("last_output_dir", directory)
+
+    def _browse_illustrator(self) -> None:
+        start_dir = self.illustrator_edit.text() or "/Applications"
+        directory = QFileDialog.getExistingDirectory(self, "Select Adobe Illustrator .app", start_dir)
+        if directory:
+            if not self._is_valid_illustrator_app(directory):
+                QMessageBox.warning(self, "Invalid selection", "Please select an Adobe Illustrator .app bundle.")
+                return
+            if self.illustrator_edit:
+                self.illustrator_edit.setText(directory)
+            self.settings.setValue("illustrator_app_path", directory)
 
     def _append_log(self, text: str) -> None:
         self.log.appendPlainText(text.rstrip("\n"))
@@ -336,6 +375,15 @@ class SvgConverterApp(QWidget):
         self.process = QProcess(self)
         self.process.setProgram("/bin/bash")
         args = [script_path, input_dir]
+
+        # Illustrator path override
+        illustrator_path = self.illustrator_edit.text().strip() if self.illustrator_edit else ""
+        if illustrator_path:
+            if not self._is_valid_illustrator_app(illustrator_path):
+                QMessageBox.critical(self, "Invalid Illustrator", "Selected Illustrator path is not a valid .app bundle.")
+                self._set_ui_enabled(True)
+                return
+            args.extend(["--illustrator-path", illustrator_path])
 
         # Collect trace settings
         if self.transparent_cb is not None:
@@ -390,6 +438,12 @@ class SvgConverterApp(QWidget):
                 os.makedirs(dest_svg_dir, exist_ok=True)
                 self._append_log(f"Copying results to: {dest_svg_dir}")
                 self._merge_copy_tree(src_svg_dir, dest_svg_dir)
+                # Post-process SVG sizes per user settings
+                self._append_log("Post-processing SVG sizes…")
+                try:
+                    self._postprocess_svg_sizing(dest_svg_dir)
+                except Exception as exc:  # noqa: BLE001
+                    self._append_log(f"SVG post-processing error: {exc}")
                 # Clean up original folder after copy
                 try:
                     shutil.rmtree(src_svg_dir)
@@ -423,6 +477,130 @@ class SvgConverterApp(QWidget):
                     shutil.copy2(src_file, dst_file)
                 except Exception as exc:  # noqa: BLE001
                     self._append_log(f"Failed to copy {src_file} -> {dst_file}: {exc}")
+
+    # ---------- SVG Post-processing for sizing ----------
+    def _postprocess_svg_sizing(self, dest_svg_dir: str) -> None:
+        # Determine requested sizing mode from UI
+        is_exact = bool(self.exact_radio and self.exact_radio.isChecked())
+        scale_value = float(self.scale_spin.value()) if self.scale_spin else 1.0
+        target_w = int(self.width_spin.value()) if self.width_spin else 0
+        target_h = int(self.height_spin.value()) if self.height_spin else 0
+
+        # If no sizing requested, skip
+        if not is_exact and abs(scale_value - 1.0) < 1e-6:
+            self._append_log("Skipping SVG resizing: no scale/size requested.")
+            return
+
+        for dirpath, _, filenames in os.walk(dest_svg_dir):
+            for name in filenames:
+                if not name.lower().endswith(".svg"):
+                    continue
+                svg_path = os.path.join(dirpath, name)
+                try:
+                    self._resize_svg(svg_path, is_exact, scale_value, target_w, target_h)
+                except Exception as exc:  # noqa: BLE001
+                    self._append_log(f"SVG resize skipped for {name}: {exc}")
+
+    def _resize_svg(self, svg_path: str, is_exact: bool, scale_value: float, target_w: int, target_h: int) -> None:
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+
+        # Namespaces handling
+        if "}" in root.tag:
+            ns = root.tag.split("}")[0].strip("{")
+        else:
+            ns = None
+
+        def get_attr(elem, key, default=""):
+            return elem.get(key) if elem.get(key) is not None else default
+
+        def parse_length_to_px(s: str) -> Optional[float]:
+            if s is None or s == "":
+                return None
+            s = s.strip()
+            m = re.match(r'^([0-9]*\\.?[0-9]+)\\s*(px|pt|in|cm|mm|pc)?$', s)
+            if not m:
+                return None
+            val = float(m.group(1))
+            unit = m.group(2) or "px"
+            # CSS px conversions (96 dpi)
+            if unit == "px":
+                return val
+            if unit == "pt":
+                return val * (96.0 / 72.0)
+            if unit == "in":
+                return val * 96.0
+            if unit == "cm":
+                return val * (96.0 / 2.54)
+            if unit == "mm":
+                return val * (96.0 / 25.4)
+            if unit == "pc":  # picas (12pt)
+                return val * 12.0 * (96.0 / 72.0)
+            return None
+
+        def format_px(val: float) -> str:
+            if abs(val - round(val)) < 1e-6:
+                return f"{int(round(val))}px"
+            return f"{val:.2f}px"
+
+        # Extract existing sizes
+        width_attr = get_attr(root, "width", "")
+        height_attr = get_attr(root, "height", "")
+        viewbox_attr = get_attr(root, "viewBox", "")
+
+        # Ensure viewBox present; derive if missing using width/height
+        if not viewbox_attr:
+            w_px = parse_length_to_px(width_attr)
+            h_px = parse_length_to_px(height_attr)
+            if w_px and h_px and w_px > 0 and h_px > 0:
+                root.set("viewBox", f"0 0 {w_px:g} {h_px:g}")
+                viewbox_attr = root.get("viewBox")
+            else:
+                # Cannot determine base size; skip
+                raise ValueError("Missing viewBox and numeric width/height")
+
+        try:
+            vb_vals = [float(x) for x in viewbox_attr.replace(",", " ").split() if x.strip()][:4]
+            if len(vb_vals) != 4:
+                raise ValueError("Invalid viewBox format")
+        except Exception as exc:
+            raise ValueError(f"Invalid viewBox '{viewbox_attr}': {exc}")
+
+        _, _, vb_w, vb_h = vb_vals
+        if vb_w <= 0 or vb_h <= 0:
+            raise ValueError("Non-positive viewBox dimensions")
+
+        # Compute new width/height
+        old_w_px = parse_length_to_px(width_attr) or vb_w
+        old_h_px = parse_length_to_px(height_attr) or vb_h
+
+        if is_exact:
+            if target_w <= 0 and target_h <= 0:
+                # Nothing to change
+                return
+            if target_w > 0 and target_h > 0:
+                new_w_px = float(target_w)
+                new_h_px = float(target_h)
+            elif target_w > 0:
+                new_w_px = float(target_w)
+                new_h_px = new_w_px * (vb_h / vb_w)
+            else:
+                new_h_px = float(target_h)
+                new_w_px = new_h_px * (vb_w / vb_h)
+        else:
+            # scale mode
+            new_w_px = vb_w * scale_value
+            new_h_px = vb_h * scale_value
+
+        # Apply attributes
+        root.set("width", format_px(new_w_px))
+        root.set("height", format_px(new_h_px))
+        root.set("preserveAspectRatio", "xMidYMid meet")
+
+        tree.write(svg_path, encoding="utf-8", xml_declaration=True)
+        self._append_log(
+            f"Resized SVG {os.path.basename(svg_path)}: {int(round(old_w_px))}x{int(round(old_h_px))} -> {int(round(new_w_px))}x{int(round(new_h_px))}"
+        )
 
     def _open_in_finder(self, path: str) -> None:
         try:
