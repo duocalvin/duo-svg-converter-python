@@ -341,6 +341,42 @@ class SvgConverterApp(QWidget):
     def _set_ui_enabled(self, enabled: bool) -> None:
         self.run_button.setEnabled(enabled)
 
+    def _sanitize_log_text(self, text: str):
+        # Detect clear-screen sequences: ESC[3J, ESC[2J, ESC[H]
+        should_clear = False
+        if "\x1b" in text:
+            if re.search(r"\x1B\[(?:[0-9;]*)(?:[Hf]|[23]J)", text):
+                should_clear = True
+        # Normalize CR to LF
+        text = text.replace("\r", "\n")
+        # Strip ANSI escape sequences
+        text = re.sub(r"\x1B[@-_][0-?]*[ -/]*[@-~]", "", text)
+        # Collapse excessive blank lines
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        # Trim trailing newlines to avoid runaway spacing
+        text = text.rstrip("\n")
+        return should_clear, text
+
+    def _handle_process_output(self, data: bytes) -> None:
+        if not data:
+            return
+        text = data.decode(errors="ignore")
+        should_clear, cleaned = self._sanitize_log_text(text)
+        if should_clear:
+            self.log.clear()
+        if cleaned:
+            self._append_log(cleaned)
+
+    def _on_proc_stdout(self) -> None:
+        if not self.process:
+            return
+        self._handle_process_output(bytes(self.process.readAllStandardOutput()))
+
+    def _on_proc_stderr(self) -> None:
+        if not self.process:
+            return
+        self._handle_process_output(bytes(self.process.readAllStandardError()))
+
     def _run_conversion(self) -> None:
         input_dir = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
@@ -410,12 +446,8 @@ class SvgConverterApp(QWidget):
         self.process.setWorkingDirectory(os.path.dirname(script_path))
 
         # Stream outputs
-        self.process.readyReadStandardOutput.connect(
-            lambda: self._append_log(bytes(self.process.readAllStandardOutput()).decode(errors="ignore"))
-        )
-        self.process.readyReadStandardError.connect(
-            lambda: self._append_log(bytes(self.process.readAllStandardError()).decode(errors="ignore"))
-        )
+        self.process.readyReadStandardOutput.connect(self._on_proc_stdout)
+        self.process.readyReadStandardError.connect(self._on_proc_stderr)
         self.process.finished.connect(lambda code, status: self._on_finished(code))
 
         # Start the process
